@@ -42,7 +42,7 @@ function parseChallenge(buffer: Buffer) {
 
 function sspiParser(parser: Parser, _options: ParserOptions, callback: (token: SSPIToken) => void) {
   parser.readUsVarByte((buffer) => {
-    callback(new SSPIToken(parseChallenge(buffer), buffer));
+    callback(new SSPIToken(buffer.length > 50 ? parseChallenge(buffer) : null, buffer));
   });
 }
 

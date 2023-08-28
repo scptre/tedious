@@ -276,7 +276,7 @@ export class Login7TokenHandler extends TokenHandler {
   }
 
   onSSPI(token: SSPIToken) {
-    if (token.ntlmpacket) {
+    if (token.ntlmpacketBuffer) {
       this.connection.ntlmpacket = token.ntlmpacket;
       this.connection.ntlmpacketBuffer = token.ntlmpacketBuffer;
     }

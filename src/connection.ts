@@ -50,6 +50,7 @@ import AggregateError from 'es-aggregate-error';
 import { version } from '../package.json';
 import { URL } from 'url';
 import { AttentionTokenHandler, InitialSqlTokenHandler, Login7TokenHandler, RequestTokenHandler, TokenHandler } from './token/handler';
+import { ModuleSupported as SspiModuleSupported, SspiClientApi, Fqdn, MakeSpn } from 'sspi-client';
 
 type BeginTransactionCallback =
   /**
@@ -309,6 +310,14 @@ interface NtlmAuthentication {
      * This is necessary for forming a connection using ntlm type
      */
     domain: string;
+    /**
+     * Security package used by SSPI-Client (Default: 'Negoitate') (Windows Only)
+     */
+    securityPackage: any;
+    /**
+     * Use the authenticated user associated with the process (Windows Only)
+     */
+    useWindowsAuthentication: boolean | undefined;
   };
 }
 
@@ -950,6 +959,10 @@ class Connection extends EventEmitter {
    * @private
    */
   ntlmpacketBuffer: undefined | Buffer;
+  /**
+   * @private
+   */
+  sspiClient: any;
 
   /**
    * @private
@@ -1034,6 +1047,11 @@ class Connection extends EventEmitter {
   databaseCollation: Collation | undefined;
 
   /**
+   * @private
+   */
+  sspiClientResponsePending: boolean;
+
+  /**
    * Note: be aware of the different options field:
    * 1. config.authentication.options
    * 2. config.options
@@ -1089,7 +1107,7 @@ class Connection extends EventEmitter {
       }
 
       if (type === 'ntlm') {
-        if (typeof options.domain !== 'string') {
+        if (typeof options.domain !== 'string' && options.useWindowsAuthentication == false) {
           throw new TypeError('The "config.authentication.options.domain" property must be of type string.');
         }
 
@@ -1106,7 +1124,9 @@ class Connection extends EventEmitter {
           options: {
             userName: options.userName,
             password: options.password,
-            domain: options.domain && options.domain.toUpperCase()
+            domain: options.domain && options.domain.toUpperCase(),
+            securityPackage: options.securityPackage,
+            useWindowsAuthentication: options.useWindowsAuthentication
           }
         };
       } else if (type === 'azure-active-directory-password') {
@@ -1288,6 +1308,13 @@ class Connection extends EventEmitter {
         lowerCaseGuids: false
       }
     };
+
+    if ((<NtlmAuthentication>this.config.authentication).options.domain &&
+        !(<NtlmAuthentication>this.config.authentication).options.userName &&
+        !(<NtlmAuthentication>this.config.authentication).options.password &&
+        SspiModuleSupported) {
+      (<NtlmAuthentication>this.config.authentication).options.useWindowsAuthentication = true;
+    }
 
     if (config.options) {
       if (config.options.port && config.options.instanceName) {
@@ -1726,6 +1753,7 @@ class Connection extends EventEmitter {
     this.debug = this.createDebug();
     this.inTransaction = false;
     this.transactionDescriptors = [Buffer.from([0, 0, 0, 0, 0, 0, 0, 0])];
+    this.sspiClientResponsePending = false;
 
     // 'beginTransaction', 'commitTransaction' and 'rollbackTransaction'
     // events are utilized to maintain inTransaction property state which in
@@ -2338,71 +2366,109 @@ class Connection extends EventEmitter {
    * @private
    */
   sendLogin7Packet() {
-    const payload = new Login7Payload({
-      tdsVersion: versions[this.config.options.tdsVersion],
-      packetSize: this.config.options.packetSize,
-      clientProgVer: 0,
-      clientPid: process.pid,
-      connectionId: 0,
-      clientTimeZone: new Date().getTimezoneOffset(),
-      clientLcid: 0x00000409
-    });
+    const sendPayload = (clientResponse: any) => {
+      const payload = new Login7Payload({
+        tdsVersion: versions[this.config.options.tdsVersion],
+        packetSize: this.config.options.packetSize,
+        clientProgVer: 0,
+        clientPid: process.pid,
+        connectionId: 0,
+        clientTimeZone: new Date().getTimezoneOffset(),
+        clientLcid: 0x00000409
+      });
 
-    const { authentication } = this.config;
-    switch (authentication.type) {
-      case 'azure-active-directory-password':
-        payload.fedAuth = {
-          type: 'ADAL',
-          echo: this.fedAuthRequired,
-          workflow: 'default'
-        };
-        break;
+      const { authentication } = this.config;
+      switch (authentication.type) {
+        case 'azure-active-directory-password':
+          payload.fedAuth = {
+            type: 'ADAL',
+            echo: this.fedAuthRequired,
+            workflow: 'default'
+          };
+          break;
 
-      case 'azure-active-directory-access-token':
-        payload.fedAuth = {
-          type: 'SECURITYTOKEN',
-          echo: this.fedAuthRequired,
-          fedAuthToken: authentication.options.token
-        };
-        break;
+        case 'azure-active-directory-access-token':
+          payload.fedAuth = {
+            type: 'SECURITYTOKEN',
+            echo: this.fedAuthRequired,
+            fedAuthToken: authentication.options.token
+          };
+          break;
 
-      case 'azure-active-directory-msi-vm':
-      case 'azure-active-directory-default':
-      case 'azure-active-directory-msi-app-service':
-      case 'azure-active-directory-service-principal-secret':
-        payload.fedAuth = {
-          type: 'ADAL',
-          echo: this.fedAuthRequired,
-          workflow: 'integrated'
-        };
-        break;
+        case 'azure-active-directory-msi-vm':
+        case 'azure-active-directory-default':
+        case 'azure-active-directory-msi-app-service':
+        case 'azure-active-directory-service-principal-secret':
+          payload.fedAuth = {
+            type: 'ADAL',
+            echo: this.fedAuthRequired,
+            workflow: 'integrated'
+          };
+          break;
 
-      case 'ntlm':
-        payload.sspi = createNTLMRequest({ domain: authentication.options.domain });
-        break;
+        case 'ntlm':
+          if (authentication.options.useWindowsAuthentication) {
+            payload.sspi = clientResponse;
+          } else {
+            payload.sspi = createNTLMRequest({ domain: authentication.options.domain });
+          }
+          break;
 
-      default:
-        payload.userName = authentication.options.userName;
-        payload.password = authentication.options.password;
+        default:
+          payload.userName = authentication.options.userName;
+          payload.password = authentication.options.password;
+      }
+
+      payload.hostname = this.config.options.workstationId || os.hostname();
+      payload.serverName = this.routingData ? this.routingData.server : this.config.server;
+      payload.appName = this.config.options.appName || 'Tedious';
+      payload.libraryName = libraryName;
+      payload.language = this.config.options.language;
+      payload.database = this.config.options.database;
+      payload.clientId = Buffer.from([1, 2, 3, 4, 5, 6]);
+
+      payload.readOnlyIntent = this.config.options.readOnlyIntent;
+      payload.initDbFatal = !this.config.options.fallbackToDefaultDb;
+
+      this.routingData = undefined;
+      this.messageIo.sendMessage(TYPE.LOGIN7, payload.toBuffer());
+
+      this.debug.payload(function() {
+        return payload.toString('  ');
+      });
+    };
+
+    // Initializing the SSPI Challenge
+    if ((<NtlmAuthentication>this.config.authentication).options.useWindowsAuthentication) {
+      Fqdn.getFqdn(this.routingData ? this.routingData.server : this.config.server, (err: any, fqdn: any) => {
+        if (err) {
+          this.emit('error', new Error('Error getting Fqdn. Error details: ' + err.message));
+          return this.close();
+        }
+
+        const spn = MakeSpn.makeSpn('MSSQLSvc', fqdn, this.config.options.port);
+
+        this.sspiClient = new SspiClientApi.SspiClient(spn, (<NtlmAuthentication>this.config.authentication).options.securityPackage);
+
+        this.sspiClientResponsePending = true;
+        this.sspiClient.getNextBlob(null, 0, 0, (clientResponse: any, isDone: any, errorCode: any, errorString: any) => {
+          if (errorCode) {
+            this.emit('error', new Error(errorString));
+            return this.close();
+          }
+
+          if (isDone) {
+            this.emit('error', new Error('Unexpected isDone=true on getNextBlob in sendLogin7Packet.'));
+            return this.close();
+          }
+
+          this.sspiClientResponsePending = false;
+          sendPayload.call(this, clientResponse);
+        });
+      });
+    } else {
+      sendPayload(null);
     }
-
-    payload.hostname = this.config.options.workstationId || os.hostname();
-    payload.serverName = this.routingData ? this.routingData.server : this.config.server;
-    payload.appName = this.config.options.appName || 'Tedious';
-    payload.libraryName = libraryName;
-    payload.language = this.config.options.language;
-    payload.database = this.config.options.database;
-    payload.clientId = Buffer.from([1, 2, 3, 4, 5, 6]);
-
-    payload.readOnlyIntent = this.config.options.readOnlyIntent;
-    payload.initDbFatal = !this.config.options.fallbackToDefaultDb;
-
-    this.routingData = undefined;
-    this.messageIo.sendMessage(TYPE.LOGIN7, payload.toBuffer());
-
-    this.debug.payload(function() {
-      return payload.toString('  ');
-    });
   }
 
   /**
@@ -3418,20 +3484,40 @@ Connection.prototype.STATE = {
             } else {
               return this.transitionTo(this.STATE.LOGGED_IN_SENDING_INITIAL_SQL);
             }
-          } else if (this.ntlmpacket) {
+          } else if (this.ntlmpacketBuffer) {
             const authentication = this.config.authentication as NtlmAuthentication;
+            if (this.sspiClient) {
+              this.sspiClientResponsePending = true;
 
-            const payload = new NTLMResponsePayload({
-              domain: authentication.options.domain,
-              userName: authentication.options.userName,
-              password: authentication.options.password,
-              ntlmpacket: this.ntlmpacket
-            });
+              // Responding to the sspi response from the server
+              this.sspiClient.getNextBlob(this.ntlmpacketBuffer, 0, (<Buffer>this.ntlmpacketBuffer).length, (clientResponse: any, isDone: any, errorCode: any, errorString: any) => {
+                if (errorCode) {
+                  this.emit('error', new Error(errorString));
+                  return this.close();
+                }
 
-            this.messageIo.sendMessage(TYPE.NTLMAUTH_PKT, payload.data);
-            this.debug.payload(function() {
-              return payload.toString('  ');
-            });
+                this.sspiClientResponsePending = false;
+
+                if (clientResponse.length) {
+                  this.messageIo.sendMessage(TYPE.NTLMAUTH_PKT, clientResponse);
+                  this.debug.payload(function() {
+                    return '  SSPI Auth';
+                  });
+                }
+              });
+            } else {
+              const payload = new NTLMResponsePayload({
+                domain: authentication.options.domain,
+                userName: authentication.options.userName,
+                password: authentication.options.password,
+                ntlmpacket: this.ntlmpacket
+              });
+
+              this.messageIo.sendMessage(TYPE.NTLMAUTH_PKT, payload.data);
+              this.debug.payload(function() {
+                return payload.toString('  ');
+              });
+            }
 
             this.ntlmpacket = undefined;
           } else if (this.loginError) {

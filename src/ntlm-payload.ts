@@ -27,8 +27,8 @@ class NTLMResponsePayload {
     const client_nonce = this.createClientNonce();
     const lmv2len = 24;
     const ntlmv2len = 16;
-    const domain = challenge.domain;
-    const username = challenge.userName;
+    const domain = challenge.domain || '';
+    const username = challenge.userName || '';
     const password = challenge.password;
     const ntlmData = challenge.ntlmpacket;
     const server_data = ntlmData.target;
